@@ -2,7 +2,7 @@
 
 A voice-first GRE vocabulary tutor powered by Sarvam AI's speech APIs, LangGraph agent orchestration, and spaced repetition.
 
-**Use case:** Someone with 30–60 days before their GRE exam who knows English but needs to close the gap to a 160+ Verbal score. They practice 15 minutes a day — on the commute, in bed, between meetings — by speaking, not typing.
+Someone with 30–60 days before their GRE exam who knows English but needs to close the gap to a 160+ Verbal score. They practice 15 minutes a day — on the commute, in bed, between meetings — by speaking, not typing.
 
 ---
 
@@ -11,28 +11,35 @@ A voice-first GRE vocabulary tutor powered by Sarvam AI's speech APIs, LangGraph
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Next.js Frontend                         │
-│   Dashboard · Learn (voice) · Quiz · Reading Comprehension      │
+│   Login · Dashboard · Learn (voice) · Quiz · Practice · Coach   │
+│   Reading Comprehension · Exam Countdown                        │
 └───────────────────────┬─────────────────────────────────────────┘
                         │ REST (JSON + base64 audio)
 ┌───────────────────────▼─────────────────────────────────────────┐
-│                    FastAPI  /session/{id}/turn                   │
+│                    FastAPI  Backend                              │
+│                                                                 │
+│   /auth/signup, /auth/login                                     │
+│   /session/start, /session/{id}/turn                            │
+│   /items/next, /items/answer                                    │
+│   /coach/next, /coach/diagnose                                  │
+│   /user/{id}/dashboard, /user/{id}/mastery, /user/{id}/profile  │
+│   /admin/ingest, /admin/generate                                │
 └───────────────────────┬─────────────────────────────────────────┘
-                        │ ainvoke(AgentState)
+                        │
 ┌───────────────────────▼─────────────────────────────────────────┐
 │                   LangGraph StateGraph                          │
 │                                                                 │
-│  classify_intent                                                │
-│       │                                                         │
+│  route_by_mode (conditional entry)                              │
 │       ├─ diagnostic  ──► generate_audio ──► END                 │
 │       ├─ learn       ──► vocab_teacher ──► generate_audio       │
 │       │                       └──► update_mastery ──► END       │
-│       ├─ quiz        ──► transcribe_audio ──► quiz_evaluator     │
+│       ├─ quiz        ──► transcribe_audio ──► quiz_evaluator    │
 │       │                       └──► generate_audio ──► END       │
 │       └─ reading     ──► reading_coach ──► generate_audio ──► END│
 └───────────────────────┬─────────────────────────────────────────┘
                         │ tool calls
 ┌───────────────────────▼─────────────────────────────────────────┐
-│                  MCP Server  (FastMCP)                          │
+│                  Tool Registry  (LangChain + MCP)               │
 │                                                                 │
 │  synthesize_pronunciation   → Sarvam TTS  bulbul:v1             │
 │  transcribe_speech          → Sarvam STT  saarika:v2            │
@@ -46,38 +53,40 @@ A voice-first GRE vocabulary tutor powered by Sarvam AI's speech APIs, LangGraph
  │   ChromaDB         │  │   PostgreSQL      │  │     Redis        │
  │                    │  │                   │  │                  │
  │  gre_words         │  │  user_word_mastery│  │  Session state   │
- │  gre_passages      │  │  study_sessions   │  │  Word cache      │
- │  (semantic search) │  │  (spaced rep)     │  │  Streak          │
- └────────────────────┘  └──────────────────┘  │  Rate limiting   │
-                                                └──────────────────┘
+ │  gre_passages      │  │  items + attempts │  │  Message history │
+ │  (semantic search) │  │  learner_profile  │  │  Word cache      │
+ │                    │  │  users            │  │  Streak          │
+ └────────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
 ---
 
-## Key Design Decisions
+## Features
 
-### Why LangGraph instead of a simple function chain?
+### Learning Modes
+- **Learn** — Voice-first vocabulary teaching with TTS pronunciation, Hindi translations, and contextual examples
+- **Quiz** — Spoken sentence-use quizzes with LLM evaluation and spaced repetition
+- **Reading** — Reading comprehension with passage retrieval from ChromaDB
+- **Diagnostic** — First-session calibration to estimate the learner's starting level
+- **Practice** — GRE-format items: Text Completion (TC), Sentence Equivalence (SE), and Reading Comprehension (RC)
+- **Coach** — AI-driven planner that inspects the learner profile and decides what to study next
 
-Each learning mode (diagnostic / learn / quiz / reading) follows a different node sequence. Routing logic is kept declarative in `agent/graph.py` as conditional edges rather than scattered `if/else` through the codebase. Adding a new mode (e.g., "essay feedback") means adding a node and a routing branch — nothing else changes.
+### Practice Item Types (GRE-format)
+| Type | Description |
+|------|-------------|
+| TC (Text Completion) | 1–3 blanks, 3–5 options each, exactly one correct per blank |
+| SE (Sentence Equivalence) | 1 blank, 6 options, exactly 2 correct (synonymous) answers |
+| RC (Reading Comprehension) | Passage + question, multiple choice, one correct answer |
 
-### Why an MCP server for Sarvam API calls?
+Items are scored deterministically. Wrong answers trigger LLM-powered error tagging to identify *why* the student erred (unknown word, wrong connotation, missed contrast, etc.).
 
-The MCP server gives each Sarvam tool:
-- A typed Pydantic input schema (safe to expose to an LLM as a tool)
-- Retry logic and structured error responses at one layer
-- Observability hooks that log latency and cost per call
+### Learner Model
+- **Elo-based ability tracking** per skill type — updates on every practice attempt
+- **Error taxonomy** — tags like `unknown_word`, `wrong_connotation`, `missed_contrast`, `missed_concession`, `missed_cause`, `misread_scope`
+- **Weak skill detection** — surfaces skills with lowest ratings for targeted practice
+- **End-of-session diagnosis** — LLM curates confusion pairs and notes from recent attempts
 
-This means the agent doesn't contain any raw HTTP calls; it only calls typed tools.
-
-### Why ChromaDB for words?
-
-The quiz evaluator needs to surface words at the right difficulty level that the user hasn't mastered yet. SQL filtering on a flat table doesn't let you do semantic clustering (e.g., "words semantically similar to `ameliorate`"). ChromaDB handles both: metadata filters for difficulty/mastery + cosine similarity for semantic neighbors.
-
-### Why Redis for session state?
-
-LangGraph `ainvoke` is stateless — each turn reconstructs state from scratch. Redis provides a fast TTL-backed store for per-session working context (current word, current passage, message history) and a word definition cache so we don't re-hit the dictionary API for the same word in multiple sessions.
-
-### Spaced repetition design
+### Spaced Repetition
 
 | Mastery level | Meaning          | Next review in |
 |:-------------:|------------------|:--------------:|
@@ -87,37 +96,11 @@ LangGraph `ainvoke` is stateless — each turn reconstructs state from scratch. 
 | 3             | Know it well     | 7 days         |
 | 4             | Mastered         | 14 days        |
 
-Mastery moves up on a correct quiz answer, down on wrong. Words at level 4 are excluded from retrieval until their `next_review` date is reached.
-
 ### Observability
+Every LLM call and tool call emits structured JSON logs with latency, token counts, cost tracking, and per-session cost rollups.
 
-Every LLM call and Sarvam API call emits a JSON log line with:
-```json
-{
-  "ts": "2024-12-01T10:23:45Z",
-  "request_id": "abc-123",
-  "user_id": "user_456",
-  "event": "llm_call",
-  "model": "openai/gpt-4o-mini",
-  "prompt_tokens": 412,
-  "completion_tokens": 89,
-  "cost_usd": 0.000116,
-  "latency_ms": 340,
-  "success": true
-}
-```
-
----
-
-## Evals
-
-Three eval suites in `backend/evals/run_evals.py`:
-
-1. **Word difficulty** — verifies ChromaDB metadata matches expected difficulty ranges for 10 sampled words
-2. **Usage evaluation** — 10 (word, sentence, expected_correct) pairs, checks LLM evaluator accuracy
-3. **Spaced repetition** — simulates a user with 500 mastered words, verifies none appear in quiz retrieval
-
-Run: `python backend/evals/run_evals.py`
+### Content Generation
+Admin endpoint to generate + validate + store new TC/SE/RC items via LLM with a critic gate.
 
 ---
 
@@ -131,12 +114,12 @@ Run: `python backend/evals/run_evals.py`
 ### Local dev (Docker)
 
 ```bash
-cp backend/.env.example .env
+cp backend/.env.example backend/.env
 # fill in SARVAM_API_KEY and OPENROUTER_API_KEY
 
 docker compose up
 
-# Ingest GRE word list (first run only)
+# Ingest GRE word list + passages + seed items (first run only)
 curl -X POST http://localhost:8000/admin/ingest
 ```
 
@@ -145,8 +128,10 @@ curl -X POST http://localhost:8000/admin/ingest
 ```bash
 # Backend
 cd backend
+python -m venv .venv
+source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
-cp .env.example .env  # fill in keys
+cp .env.example .env        # fill in keys
 uvicorn api.main:app --reload
 
 # Frontend
@@ -155,60 +140,116 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000/dashboard](http://localhost:3000/dashboard)
+Open [http://localhost:3000](http://localhost:3000)
 
 ---
 
-## Project structure
+## Project Structure
 
 ```
 lexis/
 ├── backend/
 │   ├── agent/
-│   │   ├── state.py           # AgentState TypedDict
-│   │   ├── graph.py           # LangGraph StateGraph + routing
+│   │   ├── state.py              # AgentState TypedDict
+│   │   ├── graph.py              # LangGraph StateGraph + conditional routing
+│   │   ├── planner.py            # AI coach — inspects profile, decides next action
 │   │   └── nodes/
-│   │       ├── classify.py    # Intent classification
-│   │       ├── vocab_teacher.py
-│   │       ├── quiz_evaluator.py
-│   │       ├── audio.py       # STT + TTS nodes
-│   │       ├── mastery.py     # Post-learn mastery update
-│   │       ├── diagnostic.py  # First-session calibration
-│   │       └── reading_coach.py
-│   ├── mcp/
-│   │   └── server.py          # FastMCP server (Sarvam + RAG tools)
+│   │       ├── vocab_teacher.py  # Word teaching with context + examples
+│   │       ├── quiz_evaluator.py # Spoken answer evaluation
+│   │       ├── audio.py          # STT + TTS nodes (Sarvam)
+│   │       ├── mastery.py        # Post-learn mastery update
+│   │       ├── diagnostic.py     # First-session calibration
+│   │       └── reading_coach.py  # Reading comprehension coach
+│   ├── llm/
+│   │   └── router.py             # Centralized LLM construction by task type
+│   ├── tools/
+│   │   ├── registry.py           # Typed tool registry → LangChain + MCP export
+│   │   ├── speech.py             # Sarvam TTS/STT/translate tools
+│   │   ├── lexical.py            # Dictionary + word data tools
+│   │   ├── config.py             # Tool configuration
+│   │   └── mcp_app.py            # FastMCP server export
+│   ├── content/
+│   │   ├── models.py             # TC/SE/RC Pydantic item models
+│   │   ├── taxonomy.py           # ErrorTag enum for error classification
+│   │   ├── grading.py            # Deterministic scoring + LLM error tagging
+│   │   ├── generator.py          # LLM item generation + validation
+│   │   ├── ingest.py             # Seed item ingestion
+│   │   └── data/                 # Seed items (TC, SE, RC JSON)
 │   ├── rag/
-│   │   ├── retriever.py       # ChromaDB client + ingestion
-│   │   └── data/
-│   │       └── gre_words.json # 50 seed words (expandable to 3500)
+│   │   ├── retriever.py          # ChromaDB client + ingestion
+│   │   └── data/                 # GRE words + passages JSON
 │   ├── memory/
-│   │   ├── longterm.py        # PostgreSQL mastery store
-│   │   └── working.py         # Redis session + cache
+│   │   ├── longterm.py           # PostgreSQL: mastery, items, attempts
+│   │   ├── working.py            # Redis: session state, message history, cache
+│   │   ├── learner_model.py      # Elo ability tracking + profile curation
+│   │   ├── users.py              # User auth (signup/login)
+│   │   └── migrate.py            # Alembic migration runner
+│   ├── migrations/               # Alembic migrations (5 versions)
 │   ├── evals/
-│   │   └── run_evals.py       # Three eval suites
+│   │   └── run_evals.py          # Eval suites (word difficulty, usage, SRS)
 │   ├── observability/
-│   │   └── logger.py          # Structured JSON logging + LLM cost tracking
-│   ├── api/
-│   │   └── main.py            # FastAPI entrypoint
+│   │   └── logger.py             # Structured JSON logging + cost tracking
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/
-│   └── src/app/
-│       ├── dashboard/page.tsx
-│       ├── learn/page.tsx     # Voice + text chat interface
-│       └── quiz/page.tsx      # Sentence-use quiz
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── page.tsx          # Landing page
+│   │   │   ├── login/            # Auth (signup + login)
+│   │   │   ├── dashboard/        # Study stats + words due + exam countdown
+│   │   │   ├── learn/            # Voice + text learning interface
+│   │   │   ├── quiz/             # Spoken sentence-use quiz
+│   │   │   ├── practice/         # GRE-format items (TC/SE/RC)
+│   │   │   └── coach/            # AI-driven study session
+│   │   ├── components/
+│   │   │   ├── ItemCard.tsx      # Practice item renderer
+│   │   │   ├── ExamCountdown.tsx # Countdown to exam date
+│   │   │   └── UserBadge.tsx     # User display component
+│   │   └── lib/
+│   │       ├── api.ts            # Backend API client
+│   │       ├── auth.ts           # Auth utilities
+│   │       └── types.ts          # TypeScript type definitions
+│   ├── package.json
+│   └── Dockerfile
 ├── docker-compose.yml
 └── README.md
 ```
 
 ---
 
-## Extending to 3500 GRE words
+## API Endpoints
 
-The seed file has 50 words. To ingest the full GRE corpus:
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/auth/signup` | Create account |
+| POST | `/auth/login` | Authenticate |
+| POST | `/session/start` | Start a learning session (learn/quiz/reading/diagnostic) |
+| POST | `/session/{id}/turn` | Send user input, get agent response |
+| POST | `/items/next` | Get next practice item (TC/SE/RC) |
+| POST | `/items/answer` | Submit answer, get scoring + error tags |
+| POST | `/coach/next` | AI planner decides what to study next |
+| POST | `/coach/diagnose` | End-of-session profile curation |
+| GET | `/user/{id}/dashboard` | Study stats + words due today |
+| GET | `/user/{id}/mastery` | Full mastery map |
+| GET | `/user/{id}/profile` | Learner model (ability, weak areas) |
+| PUT | `/user/{id}/exam-date` | Set GRE exam date |
+| POST | `/admin/ingest` | Ingest words, passages, and seed items |
+| POST | `/admin/generate` | Generate new practice items via LLM |
 
-1. Replace `rag/data/gre_words.json` with a complete word list (same schema)
-2. `POST /admin/ingest` — ChromaDB ingestion runs in ~2 minutes for 3500 words
-3. Passages can be added to `gre_passages` collection with the same ingestion path
+---
 
-The spaced repetition system and retrieval logic require no changes — they filter by `mastery_level` and `difficulty` metadata automatically.
+## Key Design Decisions
+
+**LangGraph for orchestration** — Each learning mode follows a different node sequence. Routing is declarative as conditional edges in `agent/graph.py`. Adding a new mode means adding a node and a routing branch.
+
+**Typed tool registry** — Single definition per tool exports as both LangChain tools (for agent use) and MCP server. No raw HTTP calls in agent code.
+
+**ChromaDB for semantic search** — The quiz evaluator needs words at the right difficulty that the user hasn't mastered. ChromaDB handles metadata filters for difficulty/mastery + cosine similarity for semantic neighbors.
+
+**Redis for session state** — LangGraph `ainvoke` is stateless per turn. Redis provides TTL-backed storage for session context, message history, and word definition caching.
+
+**Deterministic scoring, LLM error analysis** — Practice items are scored by comparing answers directly (no LLM needed for right/wrong). LLM is only invoked to analyze *why* a wrong answer was chosen.
+
+**Centralized LLM router** — All LLM construction goes through `llm/router.py` with task-based model selection (cheaper models for routing/evaluation, capable models for generation/diagnosis).
+
+**Alembic migrations** — Schema changes tracked in versioned migrations, auto-applied on startup.

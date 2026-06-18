@@ -28,6 +28,10 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Markdown files (except README)
+*.md
+!README.md
+
 # TypeScript build info
 *.tsbuildinfo
 
