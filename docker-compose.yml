@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lexis
+      POSTGRES_USER: lexis
+      POSTGRES_PASSWORD: lexis
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    # No host port mapping: the backend reaches Redis over the internal compose
+    # network (redis://redis:6379). Mapping host 6379 collided with another
+    # project's redis (valet-redis-1) and stopped this service from starting.
+    # Add `ports: ["6380:6379"]` if you want host access for debugging.
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      SARVAM_API_KEY: ${SARVAM_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DATABASE_URL: postgresql://lexis:lexis@postgres:5432/lexis
+      REDIS_URL: redis://redis:6379
+      CHROMA_PATH: /app/chroma_db
+      LOG_FILE: /app/logs/lexis.jsonl
+      CORS_ALLOW_ORIGINS: http://localhost:3000
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - chroma_data:/app/chroma_db
+      - log_data:/app/logs
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the Next.js rewrite at build time; points at the backend
+        # service over the compose network (browser calls relative /api/*).
+        INTERNAL_API_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  log_data:
